@@ -277,6 +277,9 @@ enum {
 
 enum PostPonedEventType {
     POSTPONED_PARAM_SET,
+    POSTPONED_PARAM_STATE,
+    POSTPONED_AUDIO_MONITOR,
+    POSTPONED_AUDIO_CLIP,
     POSTPONED_OUTPUT_MONITOR,
     POSTPONED_MIDI_PROGRAM_CHANGE,
     POSTPONED_MIDI_MAP,
@@ -304,6 +307,20 @@ enum UpdatePositionFlag {
 typedef struct HMI_ADDRESSING_T hmi_addressing_t;
 #endif
 typedef struct PORT_T port_t;
+
+typedef struct AUDIO_MONITOR_T {
+    jack_port_t *port;
+    char *source_port_name;
+    float value;
+    // clip detection: when enabled, this monitor reports boolean clip
+    // transitions instead of the high-rate peak stream.
+    bool clip_enabled;
+    float clip_threshold;       // knob 1: linear peak that counts as clipping
+    uint32_t clip_hold_frames;  // knob 2: frames below threshold before clearing
+    // RT-thread state
+    bool clip_active;
+    uint32_t clip_below;        // frames seen below threshold while active
+} audio_monitor_t;
 
 typedef struct CV_SOURCE_T {
     port_t *port;
@@ -583,6 +600,28 @@ typedef struct POSTPONED_PARAMETER_EVENT_T {
     float value;
 } postponed_parameter_event_t;
 
+typedef struct POSTPONED_PARAMETER_STATE_T {
+    int effect_id;
+    const char* symbol;
+    int state;
+} postponed_parameter_state_t;
+
+typedef struct POSTPONED_AUDIO_MONITOR_EVENT_T {
+    int index;
+    float value;
+} postponed_audio_monitor_event_t;
+
+typedef struct POSTPONED_AUDIO_CLIP_EVENT_T {
+    int index;
+    bool clipping;
+} postponed_audio_clip_event_t;
+
+typedef struct POSTPONED_MIDI_CONTROL_CHANGE_EVENT_T {
+    int8_t channel;
+    int8_t control;
+    int16_t value;
+} postponed_midi_control_change_event_t;
+
 typedef struct POSTPONED_MIDI_PROGRAM_CHANGE_EVENT_T {
     int8_t program;
     int8_t channel;
@@ -625,6 +664,10 @@ typedef struct POSTPONED_EVENT_T {
     enum PostPonedEventType type;
     union {
         postponed_parameter_event_t parameter;
+        postponed_parameter_state_t state;
+        postponed_audio_monitor_event_t audio_monitor;
+        postponed_audio_clip_event_t audio_clip;
+        postponed_midi_control_change_event_t control_change;
         postponed_midi_program_change_event_t program_change;
         postponed_midi_map_event_t midi_map;
         postponed_transport_event_t transport;
@@ -1274,6 +1317,64 @@ static void RunPostPonedEvents(int ignored_effect_id)
             cached_param_set.last_effect_id = eventptr->event.parameter.effect_id;
             strncpy(cached_param_set.last_symbol, eventptr->event.parameter.symbol, MAX_CHAR_BUF_SIZE);
             break;
+
+        case POSTPONED_PARAM_STATE:
+            if (eventptr->event.state.effect_id == ignored_effect_id)
+                continue;
+            if (ShouldIgnorePostPonedSymbolEvent(eventptr->event.state.effect_id,
+                                                 eventptr->event.state.symbol,
+                                                 &cached_param_state))
+                continue;
+
+            snprintf(buf, FEEDBACK_BUF_SIZE, "param_state %i %s %i", eventptr->event.state.effect_id,
+                                                                     eventptr->event.state.symbol,
+                                                                     eventptr->event.state.state);
+            socket_send_feedback_debug(buf);
+
+            // save for fast checkup next time
+            cached_param_state.last_effect_id = eventptr->event.state.effect_id;
+            strncpy(cached_param_state.last_symbol, eventptr->event.state.symbol, MAX_CHAR_BUF_SIZE);
+            break;
+
+        case POSTPONED_AUDIO_MONITOR:
+            if (ShouldIgnorePostPonedEffectEvent(eventptr->event.audio_monitor.index, &cached_audio_monitor))
+                continue;
+
+            pthread_mutex_lock(&g_audio_monitor_mutex);
+            if (eventptr->event.audio_monitor.index < g_audio_monitor_count)
+                g_audio_monitors[eventptr->event.audio_monitor.index].value = 0.f;
+            pthread_mutex_unlock(&g_audio_monitor_mutex);
+
+            snprintf(buf, FEEDBACK_BUF_SIZE, "audio_monitor %i %f", eventptr->event.audio_monitor.index,
+                                                                    eventptr->event.audio_monitor.value);
+            socket_send_feedback_debug(buf);
+
+            // save for fast checkup next time
+            cached_audio_monitor.last_effect_id = eventptr->event.audio_monitor.index;
+            break;
+
+        case POSTPONED_AUDIO_CLIP:
+        {
+            // Name-keyed feedback so mod-ui maps by port, order-independent.
+            char clip_port_name[MAX_CHAR_BUF_SIZE];
+            clip_port_name[0] = '\0';
+
+            pthread_mutex_lock(&g_audio_monitor_mutex);
+            if (eventptr->event.audio_clip.index < g_audio_monitor_count)
+                strncpy(clip_port_name,
+                        g_audio_monitors[eventptr->event.audio_clip.index].source_port_name,
+                        MAX_CHAR_BUF_SIZE - 1);
+            pthread_mutex_unlock(&g_audio_monitor_mutex);
+
+            if (clip_port_name[0] != '\0')
+            {
+                clip_port_name[MAX_CHAR_BUF_SIZE - 1] = '\0';
+                snprintf(buf, FEEDBACK_BUF_SIZE, "audio_clip %s %i", clip_port_name,
+                                                                     eventptr->event.audio_clip.clipping ? 1 : 0);
+                socket_send_feedback_debug(buf);
+            }
+            break;
+        }
 
         case POSTPONED_OUTPUT_MONITOR:
             if (eventptr->event.parameter.effect_id == ignored_effect_id)
@@ -2780,6 +2881,107 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
         break;
     }
 #endif
+
+    // Handle audio monitors
+    if (pthread_mutex_trylock(&g_audio_monitor_mutex) == 0)
+    {
+        float *monitorbuf;
+        float absvalue, oldvalue;
+
+        for (int i = 0; i < g_audio_monitor_count; ++i)
+        {
+            audio_monitor_t* const monitor = &g_audio_monitors[i];
+            monitorbuf = (float*)jack_port_get_buffer(monitor->port, nframes);
+
+            // Clip monitors report boolean transitions only, skipping the
+            // high-rate peak stream. Just detect whether any sample in this
+            // block crosses the threshold (early-exit on first hit).
+            if (monitor->clip_enabled)
+            {
+                bool over = false;
+                for (jack_nframes_t s = 0; s < nframes; ++s)
+                {
+                    if (fabsf(monitorbuf[s]) >= monitor->clip_threshold)
+                    {
+                        over = true;
+                        break;
+                    }
+                }
+
+                bool emit = false;
+                if (over)
+                {
+                    monitor->clip_below = 0;
+                    if (!monitor->clip_active)
+                    {
+                        monitor->clip_active = true;
+                        emit = true;
+                    }
+                }
+                else if (monitor->clip_active)
+                {
+                    monitor->clip_below += nframes;
+                    if (monitor->clip_below >= monitor->clip_hold_frames)
+                    {
+                        monitor->clip_active = false;
+                        emit = true;
+                    }
+                }
+
+                if (emit)
+                {
+                    postponed_event_list_data* const posteventptr = rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
+
+                    if (posteventptr)
+                    {
+                        posteventptr->event.type = POSTPONED_AUDIO_CLIP;
+                        posteventptr->event.audio_clip.index = i;
+                        posteventptr->event.audio_clip.clipping = monitor->clip_active;
+
+                        pthread_mutex_lock(&g_rtsafe_mutex);
+                        list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
+                        pthread_mutex_unlock(&g_rtsafe_mutex);
+
+                        needs_post = true;
+                    }
+                }
+
+                continue;
+            }
+
+            oldvalue = value = monitor->value;
+
+            for (jack_nframes_t i = 0 ; i < nframes; i++)
+            {
+                absvalue = fabsf(monitorbuf[i]);
+
+                if (absvalue > value)
+                    value = absvalue;
+            }
+
+            if (oldvalue < value)
+            {
+                monitor->value = value;
+
+                postponed_event_list_data* const posteventptr = rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
+
+                if (posteventptr)
+                {
+                    posteventptr->event.type = POSTPONED_AUDIO_MONITOR;
+                    posteventptr->event.audio_monitor.index = i;
+                    posteventptr->event.audio_monitor.value = value;
+
+                    pthread_mutex_lock(&g_rtsafe_mutex);
+                    list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
+                    pthread_mutex_unlock(&g_rtsafe_mutex);
+
+                    needs_post = true;
+                }
+            }
+        }
+
+        pthread_mutex_unlock(&g_audio_monitor_mutex);
+    }
 
     if (UpdateGlobalJackPosition(pos_flag, false))
         needs_post = true;
@@ -8065,6 +8267,176 @@ int effects_processing_enable(int enable)
         effects_output_data_ready();
     }
 
+    return SUCCESS;
+}
+
+int effects_monitor_audio_levels(const char *source_port_name, int enable)
+{
+    if (g_jack_global_client == NULL)
+        return ERR_INVALID_OPERATION;
+
+    if (enable)
+    {
+        for (int i = 0; i < g_audio_monitor_count; ++i)
+        {
+            if (!strcmp(g_audio_monitors[i].source_port_name, source_port_name))
+                return SUCCESS;
+        }
+
+        pthread_mutex_lock(&g_audio_monitor_mutex);
+        g_audio_monitors = realloc(g_audio_monitors, sizeof(audio_monitor_t) * (g_audio_monitor_count + 1));
+        pthread_mutex_unlock(&g_audio_monitor_mutex);
+
+        if (g_audio_monitors == NULL)
+            return ERR_MEMORY_ALLOCATION;
+
+        audio_monitor_t *monitor = &g_audio_monitors[g_audio_monitor_count];
+
+        char port_name[0xff];
+        snprintf(port_name, sizeof(port_name) - 1, "monitor_%d", g_audio_monitor_count + 1);
+
+        jack_port_t *port = jack_port_register(g_jack_global_client,
+                                               port_name,
+                                               JACK_DEFAULT_AUDIO_TYPE,
+                                               JackPortIsInput,
+                                               0);
+        if (port == NULL)
+            return ERR_JACK_PORT_REGISTER;
+
+        snprintf(port_name, sizeof(port_name) - 1, "%s:monitor_%d",
+                 jack_get_client_name(g_jack_global_client), g_audio_monitor_count + 1);
+        jack_connect(g_jack_global_client, source_port_name, port_name);
+
+        monitor->port = port;
+        monitor->source_port_name = strdup(source_port_name);
+        monitor->value = 0.f;
+        monitor->clip_enabled = false;
+        monitor->clip_threshold = 0.f;
+        monitor->clip_hold_frames = 0;
+        monitor->clip_active = false;
+        monitor->clip_below = 0;
+
+        ++g_audio_monitor_count;
+    }
+    else
+    {
+        if (g_audio_monitor_count == 0)
+            return ERR_INVALID_OPERATION;
+
+        audio_monitor_t *monitor = &g_audio_monitors[g_audio_monitor_count - 1];
+
+        if (strcmp(monitor->source_port_name, source_port_name))
+            return ERR_INVALID_OPERATION;
+
+        pthread_mutex_lock(&g_audio_monitor_mutex);
+        --g_audio_monitor_count;
+        pthread_mutex_unlock(&g_audio_monitor_mutex);
+
+        jack_port_unregister(g_jack_global_client, monitor->port);
+        free(monitor->source_port_name);
+
+        if (g_audio_monitor_count == 0)
+        {
+            free(g_audio_monitors);
+            g_audio_monitors = NULL;
+        }
+    }
+
+    return SUCCESS;
+}
+
+int effects_monitor_audio_clip(const char *source_port_name, int enable, float threshold, int hold_ms)
+{
+    if (g_jack_global_client == NULL)
+        return ERR_INVALID_OPERATION;
+
+    if (enable)
+    {
+        // Convert the clip-clear hold time (knob 2) to frames at the current rate.
+        uint32_t hold_frames = (uint32_t)((hold_ms / 1000.f) * g_sample_rate_f);
+
+        for (int i = 0; i < g_audio_monitor_count; ++i)
+        {
+            if (!strcmp(g_audio_monitors[i].source_port_name, source_port_name))
+            {
+                // Already monitored: just (re)apply clip settings live.
+                pthread_mutex_lock(&g_audio_monitor_mutex);
+                g_audio_monitors[i].clip_enabled = true;
+                g_audio_monitors[i].clip_threshold = threshold;
+                g_audio_monitors[i].clip_hold_frames = hold_frames;
+                pthread_mutex_unlock(&g_audio_monitor_mutex);
+                return SUCCESS;
+            }
+        }
+
+        pthread_mutex_lock(&g_audio_monitor_mutex);
+        g_audio_monitors = realloc(g_audio_monitors, sizeof(audio_monitor_t) * (g_audio_monitor_count + 1));
+        pthread_mutex_unlock(&g_audio_monitor_mutex);
+
+        if (g_audio_monitors == NULL)
+            return ERR_MEMORY_ALLOCATION;
+
+        audio_monitor_t *monitor = &g_audio_monitors[g_audio_monitor_count];
+
+        char port_name[0xff];
+        snprintf(port_name, sizeof(port_name) - 1, "monitor_%d", g_audio_monitor_count + 1);
+
+        jack_port_t *port = jack_port_register(g_jack_global_client,
+                                               port_name,
+                                               JACK_DEFAULT_AUDIO_TYPE,
+                                               JackPortIsInput,
+                                               0);
+        if (port == NULL)
+            return ERR_JACK_PORT_REGISTER;
+
+        snprintf(port_name, sizeof(port_name) - 1, "%s:monitor_%d",
+                 jack_get_client_name(g_jack_global_client), g_audio_monitor_count + 1);
+        jack_connect(g_jack_global_client, source_port_name, port_name);
+
+        monitor->port = port;
+        monitor->source_port_name = strdup(source_port_name);
+        monitor->value = 0.f;
+        monitor->clip_enabled = true;
+        monitor->clip_threshold = threshold;
+        monitor->clip_hold_frames = hold_frames;
+        monitor->clip_active = false;
+        monitor->clip_below = 0;
+
+        ++g_audio_monitor_count;
+    }
+    else
+    {
+        if (g_audio_monitor_count == 0)
+            return ERR_INVALID_OPERATION;
+
+        audio_monitor_t *monitor = &g_audio_monitors[g_audio_monitor_count - 1];
+
+        if (strcmp(monitor->source_port_name, source_port_name))
+            return ERR_INVALID_OPERATION;
+
+        pthread_mutex_lock(&g_audio_monitor_mutex);
+        --g_audio_monitor_count;
+        pthread_mutex_unlock(&g_audio_monitor_mutex);
+
+        jack_port_unregister(g_jack_global_client, monitor->port);
+        free(monitor->source_port_name);
+
+        if (g_audio_monitor_count == 0)
+        {
+            free(g_audio_monitors);
+            g_audio_monitors = NULL;
+        }
+    }
+
+    return SUCCESS;
+}
+
+int effects_monitor_midi_control(int channel, int enable)
+{
+    if (channel < 0 || channel > 15)
+        return ERR_INVALID_OPERATION;
+
+    g_monitored_midi_controls[channel] = enable != 0;
     return SUCCESS;
 }
 

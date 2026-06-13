@@ -18,6 +18,7 @@ MANDIR = $(SHAREDIR)/man/man1/
 
 # default compiler and linker flags
 CFLAGS += -O3 -Wall -Wextra -c -std=gnu99 -fPIC -D_GNU_SOURCE -pthread
+CFLAGS += -mcpu=cortex-a76 -mtune=cortex-a76
 CFLAGS += -Wno-deprecated-declarations
 CFLAGS += -Werror=implicit-function-declaration -Werror=return-type
 
@@ -46,7 +47,8 @@ CFLAGS += -Winit-self -Wjump-misses-init -Wmissing-prototypes -Wnested-externs -
 endif
 
 # libraries
-LIBS = $(shell pkg-config --libs lilv-0)
+# Force shared library linking instead of static
+LIBS = /usr/lib/aarch64-linux-gnu/liblilv-0.so -ldl -lsord-0 -lserd-0 -lsratom-0
 
 ifeq ($(MOD_DESKTOP),1)
 LIBS += $(subst -ljack ,-ljackserver ,$(shell pkg-config --libs jack))

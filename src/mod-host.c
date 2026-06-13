@@ -297,6 +297,14 @@ static void monitor_output_cb(proto_t *proto)
     protocol_response_int(resp, proto);
 }
 
+static void monitor_audio_clip_cb(proto_t *proto)
+{
+    int resp;
+    resp = effects_monitor_audio_clip(proto->list[1], atoi(proto->list[2]),
+                                      atof(proto->list[3]), atoi(proto->list[4]));
+    protocol_response_int(resp, proto);
+}
+
 static void monitor_midi_program_cb(proto_t *proto)
 {
     int resp;
@@ -690,6 +698,7 @@ static int mod_host_init(jack_client_t* client, int socket_port, int feedback_po
     protocol_add_command(EFFECT_SET_BPB, effects_set_beats_per_bar_cb);
     protocol_add_command(MONITOR_ADDR_SET, monitor_addr_set_cb);
     protocol_add_command(MONITOR_OUTPUT, monitor_output_cb);
+    protocol_add_command(MONITOR_AUDIO_CLIP, monitor_audio_clip_cb);
     protocol_add_command(MONITOR_MIDI_PROGRAM, monitor_midi_program_cb);
     protocol_add_command(MIDI_LEARN, midi_learn_cb);
     protocol_add_command(MIDI_MAP, midi_map_cb);
