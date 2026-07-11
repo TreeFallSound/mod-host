@@ -77,6 +77,14 @@ ifeq ($(shell pkg-config --atleast-version=0.22.0 lilv-0 && echo true), true)
 INCS += -DHAVE_NEW_LILV
 endif
 
+# serd, for skimming LV2 manifests at startup instead of building a full lilv
+# world. It comes in transitively via lilv, but -Wl,--no-undefined means we
+# have to link it ourselves to call it.
+ifeq ($(shell pkg-config --exists serd-0 && echo true), true)
+LIBS += $(shell pkg-config --libs serd-0)
+INCS += $(shell pkg-config --cflags serd-0) -DHAVE_SERD
+endif
+
 ifeq ($(shell pkg-config --atleast-version=1.18 lv2 && echo true),true)
 INCS += -DHAVE_LV2_STATE_FREE_PATH
 endif
