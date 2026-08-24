@@ -198,6 +198,13 @@ typedef struct {
 // transport defaults
 #define TRANSPORT_TICKS_PER_BEAT 1920.0
 
+// beat_sync flags. A bar heartbeat gives a beat_in_bar that a client can use
+// for phase. A tempo change or a meter change does not. g_transport_reset
+// makes the next JackTimebase calculate the timeline again from the absolute
+// frame at the new tempo. The bar and the beat then change to new values.
+#define BEAT_SYNC_FLAG_NEW_BAR 0x1
+#define BEAT_SYNC_FLAG_TEMPO_CHANGED 0x2
+
 
 /*
 ************************************************************************************************************************
@@ -611,6 +618,7 @@ typedef struct POSTPONED_BEAT_SYNC_EVENT_T {
     float bpm;
     float bpb;
     double beat_in_bar; // fractional beat position within the current bar at `t_us`, from JACK BBT
+    int32_t flags;      // BEAT_SYNC_FLAG_*: the cause of this sample. A client does not calculate it.
 } postponed_beat_sync_event_t;
 
 typedef struct POSTPONED_JACK_MIDI_CONNECT_EVENT_T {
@@ -1348,16 +1356,20 @@ static void RunPostPonedEvents(int ignored_effect_id)
             break;
 
         case POSTPONED_BEAT_SYNC:
-            // A clock-sample: (t_us=now, bpm, bpb, beat_in_bar). Consumers
-            // forward-extrapolate pos(t) = beat_in_bar + (t - t_us) * bpm / 60
-            // from this; every sample fully replaces prior anchor state (not a
-            // delta), so a dropped/late one just means more extrapolation,
-            // never a wrong lock. All delivered (not a state to dedup).
-            snprintf(buf, FEEDBACK_BUF_SIZE, "beat_sync %llu %f %f %f",
+            // A clock-sample: (t_us=now, bpm, bpb, beat_in_bar, flags).
+            // Consumers forward-extrapolate
+            // pos(t) = beat_in_bar + (t - t_us) * bpm / 60 from this; every
+            // sample fully replaces prior anchor state (not a delta), so a
+            // dropped/late one just means more extrapolation, never a wrong
+            // lock. All delivered (not a state to dedup). The phase is
+            // correct only if NEW_BAR is set. Refer to the BEAT_SYNC_FLAG_*
+            // notes.
+            snprintf(buf, FEEDBACK_BUF_SIZE, "beat_sync %llu %f %f %f %d",
                      (unsigned long long)eventptr->event.beat_sync.t_us,
                      eventptr->event.beat_sync.bpm,
                      eventptr->event.beat_sync.bpb,
-                     eventptr->event.beat_sync.beat_in_bar);
+                     eventptr->event.beat_sync.beat_in_bar,
+                     eventptr->event.beat_sync.flags);
             socket_send_feedback_debug(buf);
             break;
 
@@ -2539,9 +2551,11 @@ static bool UpdateGlobalJackPosition(enum UpdatePositionFlag flag, bool do_post)
             {
                 posteventptr->event.type = POSTPONED_BEAT_SYNC;
                 posteventptr->event.beat_sync.t_us = now_us;
-                posteventptr->event.beat_sync.bpm = g_jack_pos.beats_per_minute;
-                posteventptr->event.beat_sync.bpb = g_jack_pos.beats_per_bar;
+                posteventptr->event.beat_sync.bpm = g_transport_bpm;
+                posteventptr->event.beat_sync.bpb = g_transport_bpb;
                 posteventptr->event.beat_sync.beat_in_bar = beat_in_bar;
+                posteventptr->event.beat_sync.flags = (new_bar ? BEAT_SYNC_FLAG_NEW_BAR : 0) |
+                                                      (bpm_or_bpb_changed ? BEAT_SYNC_FLAG_TEMPO_CHANGED : 0);
 
                 pthread_mutex_lock(&g_rtsafe_mutex);
                 list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
