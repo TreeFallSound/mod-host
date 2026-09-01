@@ -4465,6 +4465,20 @@ int effects_finish(int close_client)
 
     if (g_capture_ports) jack_free(g_capture_ports);
     if (g_playback_ports) jack_free(g_playback_ports);
+
+#ifdef HAVE_JACK2
+    if (close_client && g_jack_global_client != NULL)
+    {
+        jack_intclient_t merger = jack_internal_client_handle(g_jack_global_client, "mod-midi-merger", NULL);
+        if (merger != 0)
+            jack_internal_client_unload(g_jack_global_client, merger);
+
+        jack_intclient_t broadcaster = jack_internal_client_handle(g_jack_global_client, "mod-midi-broadcaster", NULL);
+        if (broadcaster != 0)
+            jack_internal_client_unload(g_jack_global_client, broadcaster);
+    }
+#endif
+
     if (close_client) jack_client_close(g_jack_global_client);
     symap_free(g_symap);
     lilv_node_free(g_lilv_nodes.atom_port);
