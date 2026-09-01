@@ -35,6 +35,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -197,6 +198,13 @@ typedef struct {
 // transport defaults
 #define TRANSPORT_TICKS_PER_BEAT 1920.0
 
+// beat_sync flags. A bar heartbeat gives a beat_in_bar that a client can use
+// for phase. A tempo change or a meter change does not. g_transport_reset
+// makes the next JackTimebase calculate the timeline again from the absolute
+// frame at the new tempo. The bar and the beat then change to new values.
+#define BEAT_SYNC_FLAG_NEW_BAR 0x1
+#define BEAT_SYNC_FLAG_TEMPO_CHANGED 0x2
+
 
 /*
 ************************************************************************************************************************
@@ -281,6 +289,7 @@ enum PostPonedEventType {
     POSTPONED_MIDI_PROGRAM_CHANGE,
     POSTPONED_MIDI_MAP,
     POSTPONED_TRANSPORT,
+    POSTPONED_BEAT_SYNC,
     POSTPONED_JACK_MIDI_CONNECT,
     POSTPONED_LOG_TRACE, // stack allocated, rt-safe
     POSTPONED_LOG_MESSAGE, // heap allocated
@@ -604,6 +613,14 @@ typedef struct POSTPONED_TRANSPORT_EVENT_T {
     float bpm;
 } postponed_transport_event_t;
 
+typedef struct POSTPONED_BEAT_SYNC_EVENT_T {
+    uint64_t t_us; // CLOCK_MONOTONIC microseconds at which this sample was taken ("now", not back-dated)
+    float bpm;
+    float bpb;
+    double beat_in_bar; // fractional beat position within the current bar at `t_us`, from JACK BBT
+    int32_t flags;      // BEAT_SYNC_FLAG_*: the cause of this sample. A client does not calculate it.
+} postponed_beat_sync_event_t;
+
 typedef struct POSTPONED_JACK_MIDI_CONNECT_EVENT_T {
     jack_port_id_t port;
 } postponed_jack_midi_connect_event_t;
@@ -628,6 +645,7 @@ typedef struct POSTPONED_EVENT_T {
         postponed_midi_program_change_event_t program_change;
         postponed_midi_map_event_t midi_map;
         postponed_transport_event_t transport;
+        postponed_beat_sync_event_t beat_sync;
         postponed_jack_midi_connect_event_t jack_midi_connect;
         postponed_log_trace_event_t log_trace;
         postponed_log_message_event_t log_message;
@@ -725,6 +743,7 @@ static jack_port_t *g_audio_out2_port;
 static jack_port_t *g_midi_in_port;
 static jack_position_t g_jack_pos;
 static bool g_jack_rolling;
+static int32_t g_last_beat_sync_bar = -1;
 static volatile double g_transport_bpb;
 static volatile double g_transport_bpm;
 static volatile bool g_transport_reset;
@@ -1334,6 +1353,24 @@ static void RunPostPonedEvents(int ignored_effect_id)
 
             // ignore older transport changes
             got_transport = true;
+            break;
+
+        case POSTPONED_BEAT_SYNC:
+            // A clock-sample: (t_us=now, bpm, bpb, beat_in_bar, flags).
+            // Consumers forward-extrapolate
+            // pos(t) = beat_in_bar + (t - t_us) * bpm / 60 from this; every
+            // sample fully replaces prior anchor state (not a delta), so a
+            // dropped/late one just means more extrapolation, never a wrong
+            // lock. All delivered (not a state to dedup). The phase is
+            // correct only if NEW_BAR is set. Refer to the BEAT_SYNC_FLAG_*
+            // notes.
+            snprintf(buf, FEEDBACK_BUF_SIZE, "beat_sync %llu %f %f %f %d",
+                     (unsigned long long)eventptr->event.beat_sync.t_us,
+                     eventptr->event.beat_sync.bpm,
+                     eventptr->event.beat_sync.bpb,
+                     eventptr->event.beat_sync.beat_in_bar,
+                     eventptr->event.beat_sync.flags);
+            socket_send_feedback_debug(buf);
             break;
 
         case POSTPONED_JACK_MIDI_CONNECT:
@@ -2472,32 +2509,104 @@ static bool UpdateGlobalJackPosition(enum UpdatePositionFlag flag, bool do_post)
         g_jack_pos.beats_per_minute = g_transport_bpm;
     }
 
+    // Post a beat_sync clock-sample so external clients (pi-Stomp) can drive a
+    // metronome/count-in LED without running their own JACK client. This is a
+    // *sample of the transport clock* (t_us=now, bpm, bpb, beat_in_bar), not a
+    // back-dated "downbeat event" — the consumer forward-extrapolates
+    // pos(t) = beat_in_bar + (t - t_us) * bpm/60, so correctness never depends
+    // on cadence (the absolute bar count is DAW-context, not needed here).
+    // Emitted on two triggers:
+    //   - a new bar (heartbeat; also what re-anchors after a stop/start)
+    //   - a discrete bpm/bpb change while rolling (so a tap-tempo/CC-driven
+    //     change re-anchors the pi the same process cycle, not ~1 bar later)
+    // A dropped/late sample just means more extrapolation, never a wrong lock.
+    bool posted = false;
+
+    if (g_jack_rolling && (g_jack_pos.valid & JackPositionBBT) != 0x0 && g_jack_pos.beats_per_minute > 0.0)
+    {
+        const int32_t bar = (int32_t)g_jack_pos.bar - 1;
+        const bool new_bar = (bar != g_last_beat_sync_bar);
+        // UPDATE_POSITION_FORCED means that a caller has just set bpm or bpb.
+        // Those callers write the global before they call, thus old_bpm and
+        // old_bpb already hold the new value and can not show the change.
+        const bool bpm_or_bpb_changed = (flag == UPDATE_POSITION_FORCED) ||
+                                        ((flag == UPDATE_POSITION_IF_CHANGED) &&
+                                         (doubles_differ_enough(old_bpb, g_transport_bpb) ||
+                                          doubles_differ_enough(old_bpm, g_transport_bpm)));
+
+        if (new_bar || bpm_or_bpb_changed)
+        {
+            g_last_beat_sync_bar = bar;
+
+            const double tick = (g_jack_pos.valid & JackTickDouble) ? g_jack_pos.tick_double : g_jack_pos.tick;
+            const double beat_in_bar = (g_jack_pos.beat - 1) + (tick / g_jack_pos.ticks_per_beat);
+
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            const uint64_t now_us = (uint64_t)now.tv_sec * 1000000ULL + (uint64_t)now.tv_nsec / 1000ULL;
+
+            postponed_event_list_data* const posteventptr = rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
+
+            if (posteventptr)
+            {
+                posteventptr->event.type = POSTPONED_BEAT_SYNC;
+                posteventptr->event.beat_sync.t_us = now_us;
+                posteventptr->event.beat_sync.bpm = g_transport_bpm;
+                posteventptr->event.beat_sync.bpb = g_transport_bpb;
+                posteventptr->event.beat_sync.beat_in_bar = beat_in_bar;
+                posteventptr->event.beat_sync.flags = (new_bar ? BEAT_SYNC_FLAG_NEW_BAR : 0) |
+                                                      (bpm_or_bpb_changed ? BEAT_SYNC_FLAG_TEMPO_CHANGED : 0);
+
+                pthread_mutex_lock(&g_rtsafe_mutex);
+                list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
+                pthread_mutex_unlock(&g_rtsafe_mutex);
+
+                posted = true;
+            }
+        }
+    }
+    else
+    {
+        // stopped or no valid BBT: forget the last bar so a fresh roll re-anchors immediately
+        g_last_beat_sync_bar = -1;
+    }
+
     if (flag == UPDATE_POSITION_SKIP)
-        return false;
+    {
+        if (posted && do_post)
+            sem_post(&g_postevents_semaphore);
+        return posted;
+    }
     if (flag == UPDATE_POSITION_IF_CHANGED &&
         old_rolling == g_jack_rolling &&
         !doubles_differ_enough(old_bpb, g_transport_bpb) &&
         !doubles_differ_enough(old_bpm, g_transport_bpm))
-        return false;
+    {
+        if (posted && do_post)
+            sem_post(&g_postevents_semaphore);
+        return posted;
+    }
 
     postponed_event_list_data* const posteventptr = rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
 
-    if (!posteventptr)
-        return false;
+    if (posteventptr)
+    {
+        posteventptr->event.type = POSTPONED_TRANSPORT;
+        posteventptr->event.transport.rolling = g_jack_rolling;
+        posteventptr->event.transport.bpb     = g_transport_bpb;
+        posteventptr->event.transport.bpm     = g_transport_bpm;
 
-    posteventptr->event.type = POSTPONED_TRANSPORT;
-    posteventptr->event.transport.rolling = g_jack_rolling;
-    posteventptr->event.transport.bpb     = g_transport_bpb;
-    posteventptr->event.transport.bpm     = g_transport_bpm;
+        pthread_mutex_lock(&g_rtsafe_mutex);
+        list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
+        pthread_mutex_unlock(&g_rtsafe_mutex);
 
-    pthread_mutex_lock(&g_rtsafe_mutex);
-    list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
-    pthread_mutex_unlock(&g_rtsafe_mutex);
+        posted = true;
+    }
 
-    if (do_post)
+    if (posted && do_post)
         sem_post(&g_postevents_semaphore);
 
-    return true;
+    return posted;
 }
 
 static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
@@ -6902,7 +7011,7 @@ int effects_set_beats_per_minute(double bpm)
     g_transport_bpm = bpm;
     g_transport_reset = true;
     TriggerJackTimebase(false);
-    UpdateGlobalJackPosition(UPDATE_POSITION_FORCED, false);
+    UpdateGlobalJackPosition(UPDATE_POSITION_FORCED, true);
   } else {
     result = ERR_JACK_VALUE_OUT_OF_RANGE;
   }
